@@ -7,18 +7,19 @@ import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 
 import '../../core/storage/preoperacional_local_db.dart';
-import 'sincronizacion_service.dart';
 
 class PreoperacionalPage extends StatefulWidget {
   final Map<String, dynamic> activo;
   final Map<String, dynamic> plantilla;
   final String? idLocal;
   final Map<String, dynamic>? borrador;
+  final int usuarioId;
 
   const PreoperacionalPage({
     super.key,
     required this.activo,
     required this.plantilla,
+    required this.usuarioId,
     this.idLocal,
     this.borrador,
   });
@@ -39,7 +40,6 @@ class _PreoperacionalPageState extends State<PreoperacionalPage> {
   bool _preguntasCompletadas = false;
   bool _guardando = false;
   bool _guardandoLocal = false;
-  bool _sincronizando = false;
   bool _cerrada = false;
   bool _cargandoEstado = true;
 
@@ -58,7 +58,6 @@ class _PreoperacionalPageState extends State<PreoperacionalPage> {
     super.initState();
 
     _idLocal = widget.idLocal ?? _generarUuid();
-    _restaurarBorrador();
     _inicializarEstadoLocal();
   }
 
@@ -81,7 +80,28 @@ class _PreoperacionalPageState extends State<PreoperacionalPage> {
   }
 
   Future<void> _inicializarEstadoLocal() async {
+    if (widget.usuarioId <= 0) {
+      if (mounted) {
+        setState(() {
+          _cargandoEstado = false;
+          _estadoGuardado = 'No se pudo identificar al usuario.';
+        });
+      }
+      return;
+    }
+
     if (kIsWeb) {
+      // En Web no se utiliza SQLite.
+      // No se restaura un borrador sin propietario verificable.
+      final borrador = widget.borrador;
+      final propietario = int.tryParse(
+        borrador?['usuario_id']?.toString() ?? '',
+      );
+
+      if (propietario == widget.usuarioId) {
+        _restaurarBorrador(borrador);
+      }
+
       if (mounted) {
         setState(() {
           _cargandoEstado = false;
@@ -93,10 +113,25 @@ class _PreoperacionalPageState extends State<PreoperacionalPage> {
 
     try {
       final registro = await PreoperacionalLocalDb.instance.obtenerPorId(
-        _idLocal,
+        id: _idLocal,
+        usuarioId: widget.usuarioId,
       );
 
       if (!mounted) return;
+
+      Map<String, dynamic>? borradorSeguro = registro;
+
+      if (borradorSeguro == null && widget.borrador != null) {
+        final propietario = int.tryParse(
+          widget.borrador!['usuario_id']?.toString() ?? '',
+        );
+
+        if (propietario == widget.usuarioId) {
+          borradorSeguro = widget.borrador;
+        }
+      }
+
+      _restaurarBorrador(borradorSeguro);
 
       if (registro != null) {
         final estado = registro['estado']?.toString() ?? '';
@@ -114,6 +149,18 @@ class _PreoperacionalPageState extends State<PreoperacionalPage> {
             _preguntasCompletadas = true;
             _estadoGuardado = 'Cuestionario completado; cierre pendiente';
           });
+        } else if (estado == PreoperacionalLocalDb.estadoSincronizadoParcial) {
+          setState(() {
+            _cerrada = false;
+            _preguntasCompletadas = false;
+            _estadoGuardado = 'Avance sincronizado; puedes continuar editando';
+          });
+        } else if (estado == PreoperacionalLocalDb.estadoPendiente) {
+          setState(() {
+            _cerrada = false;
+            _preguntasCompletadas = false;
+            _estadoGuardado = 'Borrador guardado localmente';
+          });
         }
       }
     } catch (e) {
@@ -122,13 +169,15 @@ class _PreoperacionalPageState extends State<PreoperacionalPage> {
           _estadoGuardado = 'No se pudo consultar el estado local: $e';
         });
       }
+
+      debugPrint('Error al inicializar la inspección local: $e');
     } finally {
       if (mounted) {
         setState(() => _cargandoEstado = false);
       }
     }
 
-    if (!_cerrada && !_preguntasCompletadas) {
+    if (!_cerrada && !_preguntasCompletadas && mounted) {
       await _guardarBorradorLocal();
     }
   }
@@ -146,76 +195,87 @@ class _PreoperacionalPageState extends State<PreoperacionalPage> {
     return '$dia/$mes/$anio $hora:$minuto:$segundo';
   }
 
-  void _restaurarBorrador() {
-    final borrador = widget.borrador;
+  void _restaurarBorrador([Map<String, dynamic>? fuente]) {
+    final borrador = fuente ?? widget.borrador;
     if (borrador == null) return;
 
-    final respuestasGuardadas = borrador['respuestas'];
+    dynamic respuestasGuardadas = borrador['respuestas'];
 
-    if (respuestasGuardadas is List) {
-      for (final elemento in respuestasGuardadas) {
-        if (elemento is! Map) continue;
+    if (respuestasGuardadas is! List) {
+      final respuestasJson = borrador['respuestas_json'];
 
-        final dato = Map<String, dynamic>.from(elemento);
-        final id = int.tryParse(dato['item_id']?.toString() ?? '');
-
-        if (id == null) continue;
-
-        final respuesta = dato['respuesta']?.toString();
-
-        if (respuesta != null && respuesta.isNotEmpty) {
-          _respuestas[id] = respuesta;
+      if (respuestasJson is String && respuestasJson.isNotEmpty) {
+        try {
+          respuestasGuardadas = jsonDecode(respuestasJson);
+        } catch (e) {
+          debugPrint('Error al decodificar respuestas locales: $e');
+          return;
         }
+      }
+    }
 
-        final observacion = dato['observacion']?.toString() ?? '';
+    if (respuestasGuardadas is! List) return;
 
-        if (observacion.isNotEmpty) {
-          _controlObservacion(id).text = observacion;
-        }
+    for (final elemento in respuestasGuardadas) {
+      if (elemento is! Map) continue;
 
-        final fotosRestauradas = <Map<String, dynamic>>[];
-        final fotosGuardadas = dato['fotos'];
+      final dato = Map<String, dynamic>.from(elemento);
+      final id = int.tryParse(dato['item_id']?.toString() ?? '');
 
-        if (fotosGuardadas is List) {
-          for (final elementoFoto in fotosGuardadas.take(
-            _maxFotosPorPregunta,
-          )) {
-            if (elementoFoto is! Map) continue;
+      if (id == null) continue;
 
-            final fotoDato = Map<String, dynamic>.from(elementoFoto);
-            final base64 = fotoDato['foto_base64']?.toString();
+      final respuesta = dato['respuesta']?.toString();
 
-            if (base64 == null || base64.isEmpty) continue;
+      if (respuesta != null && respuesta.isNotEmpty) {
+        _respuestas[id] = respuesta;
+      }
 
-            try {
-              fotosRestauradas.add({
-                'bytes': base64Decode(base64),
-                'capturada_en':
-                    fotoDato['capturada_en']?.toString() ??
-                    DateTime.now().toIso8601String(),
-              });
-            } catch (e) {
-              debugPrint('Error al restaurar una foto de la pregunta $id: $e');
-            }
-          }
-        } else {
-          final fotoBase64 = dato['foto_base64']?.toString();
+      final observacion = dato['observacion']?.toString() ?? '';
 
-          if (fotoBase64 != null && fotoBase64.isNotEmpty) {
-            try {
-              fotosRestauradas.add({
-                'bytes': base64Decode(fotoBase64),
-                'capturada_en': DateTime.now().toIso8601String(),
-              });
-            } catch (e) {
-              debugPrint('Error al restaurar foto de pregunta $id: $e');
-            }
+      if (observacion.isNotEmpty) {
+        _controlObservacion(id).text = observacion;
+      }
+
+      final fotosRestauradas = <Map<String, dynamic>>[];
+      final fotosGuardadas = dato['fotos'];
+
+      if (fotosGuardadas is List) {
+        for (final elementoFoto in fotosGuardadas.take(_maxFotosPorPregunta)) {
+          if (elementoFoto is! Map) continue;
+
+          final fotoDato = Map<String, dynamic>.from(elementoFoto);
+          final base64 = fotoDato['foto_base64']?.toString();
+
+          if (base64 == null || base64.isEmpty) continue;
+
+          try {
+            fotosRestauradas.add({
+              'bytes': base64Decode(base64),
+              'capturada_en':
+                  fotoDato['capturada_en']?.toString() ??
+                  DateTime.now().toIso8601String(),
+            });
+          } catch (e) {
+            debugPrint('Error al restaurar foto de pregunta $id: $e');
           }
         }
+      } else {
+        final fotoBase64 = dato['foto_base64']?.toString();
 
-        if (fotosRestauradas.isNotEmpty) {
-          _fotosPreguntas[id] = fotosRestauradas;
+        if (fotoBase64 != null && fotoBase64.isNotEmpty) {
+          try {
+            fotosRestauradas.add({
+              'bytes': base64Decode(fotoBase64),
+              'capturada_en': DateTime.now().toIso8601String(),
+            });
+          } catch (e) {
+            debugPrint('Error al restaurar foto de pregunta $id: $e');
+          }
         }
+      }
+
+      if (fotosRestauradas.isNotEmpty) {
+        _fotosPreguntas[id] = fotosRestauradas;
       }
     }
 
@@ -317,7 +377,11 @@ class _PreoperacionalPageState extends State<PreoperacionalPage> {
   }
 
   Future<bool> _guardarBorradorLocal() async {
-    if (kIsWeb || _cerrada || _preguntasCompletadas || _cargandoEstado) {
+    if (kIsWeb ||
+        widget.usuarioId <= 0 ||
+        _cerrada ||
+        _preguntasCompletadas ||
+        _cargandoEstado) {
       return false;
     }
 
@@ -339,6 +403,7 @@ class _PreoperacionalPageState extends State<PreoperacionalPage> {
 
       await PreoperacionalLocalDb.instance.guardarBorrador(
         id: _idLocal,
+        usuarioId: widget.usuarioId,
         activo: activoSinFoto,
         plantilla: widget.plantilla,
         lecturaInicial: _obtenerLecturaInicial(),
@@ -365,6 +430,7 @@ class _PreoperacionalPageState extends State<PreoperacionalPage> {
         );
       }
 
+      debugPrint('Error al guardar el borrador local: $e');
       return false;
     } finally {
       _guardandoLocal = false;
@@ -496,7 +562,9 @@ class _PreoperacionalPageState extends State<PreoperacionalPage> {
   }
 
   Future<void> _finalizarRevision() async {
-    if (_soloLectura || _guardando) return;
+    if (_soloLectura || _guardando || widget.usuarioId <= 0) {
+      return;
+    }
 
     final pendientes = <String>[];
 
@@ -539,8 +607,9 @@ class _PreoperacionalPageState extends State<PreoperacionalPage> {
         title: const Text('Finalizar cuestionario'),
         content: const Text(
           'Se guardarán las respuestas de esta inspección. '
-          'La lectura final y la firma se registrarán después '
-          'desde el menú principal. ¿Deseas continuar?',
+          'La lectura final, la fotografía del contador y la firma '
+          'se registrarán después desde el menú principal. '
+          '¿Deseas continuar?',
         ),
         actions: [
           TextButton(
@@ -568,7 +637,10 @@ class _PreoperacionalPageState extends State<PreoperacionalPage> {
         );
       }
 
-      await PreoperacionalLocalDb.instance.marcarPreguntasCompletadas(_idLocal);
+      await PreoperacionalLocalDb.instance.marcarPreguntasCompletadas(
+        id: _idLocal,
+        usuarioId: widget.usuarioId,
+      );
 
       if (!mounted) return;
 
@@ -588,90 +660,11 @@ class _PreoperacionalPageState extends State<PreoperacionalPage> {
           SnackBar(content: Text('No se pudo guardar el cuestionario: $e')),
         );
       }
+
+      debugPrint('Error al finalizar el cuestionario: $e');
     } finally {
       if (mounted) {
         setState(() => _guardando = false);
-      }
-    }
-  }
-
-  Future<void> _sincronizarPendientes() async {
-    if (_sincronizando || kIsWeb) return;
-
-    setState(() => _sincronizando = true);
-
-    try {
-      final resultado = await SincronizacionService().sincronizarPendientes();
-
-      if (!mounted) return;
-
-      final total = resultado['total'] as int? ?? 0;
-      final sincronizados = resultado['sincronizados'] as int? ?? 0;
-      final fallidos = resultado['fallidos'] as int? ?? 0;
-      final errores = resultado['errores'];
-
-      await showDialog<void>(
-        context: context,
-        builder: (dialogContext) => AlertDialog(
-          title: const Text('Resultado de sincronización'),
-          content: SingleChildScrollView(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text('Pendientes encontrados: $total'),
-                Text('Sincronizados: $sincronizados'),
-                Text('Fallidos: $fallidos'),
-                if (errores is List && errores.isNotEmpty) ...[
-                  const SizedBox(height: 12),
-                  const Text(
-                    'Detalles de los errores:',
-                    style: TextStyle(fontWeight: FontWeight.bold),
-                  ),
-                  const SizedBox(height: 6),
-                  ...errores.take(5).map((error) {
-                    if (error is! Map) {
-                      return const SizedBox.shrink();
-                    }
-
-                    return Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: Text('${error['id']}: ${error['mensaje']}'),
-                    );
-                  }),
-                  if (errores.length > 5)
-                    Text('Y ${errores.length - 5} errores más.'),
-                ],
-              ],
-            ),
-          ),
-          actions: [
-            FilledButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('Aceptar'),
-            ),
-          ],
-        ),
-      );
-
-      if (mounted) {
-        setState(() {
-          _estadoGuardado = total == 0
-              ? 'No hay inspecciones pendientes'
-              : fallidos == 0
-              ? 'Solicitud de sincronización completada'
-              : 'Hay inspecciones pendientes de sincronizar';
-        });
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('No se pudo sincronizar: $e')));
-      }
-    } finally {
-      if (mounted) {
-        setState(() => _sincronizando = false);
       }
     }
   }
@@ -691,25 +684,7 @@ class _PreoperacionalPageState extends State<PreoperacionalPage> {
     final lectura = _obtenerLecturaInicial();
 
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Preoperacional'),
-        actions: [
-          IconButton(
-            tooltip: 'Sincronizar inspecciones pendientes',
-            onPressed: _sincronizando || kIsWeb ? null : _sincronizarPendientes,
-            icon: _sincronizando
-                ? const Padding(
-                    padding: EdgeInsets.all(12),
-                    child: SizedBox(
-                      width: 22,
-                      height: 22,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    ),
-                  )
-                : const Icon(Icons.cloud_upload_outlined),
-          ),
-        ],
-      ),
+      appBar: AppBar(title: const Text('Preoperacional')),
       body: Center(
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 850),

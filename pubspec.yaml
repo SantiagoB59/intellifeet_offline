@@ -42,8 +42,10 @@ dependencies:
   flutter_secure_storage: ^11.2.0
   image_picker: ^1.2.4
   image: ^4.10.1
+  crypto: ^3.0.7
 
 dev_dependencies:
+  flutter_launcher_icons: ^0.14.4
   flutter_test:
     sdk: flutter
 
@@ -95,3 +97,9 @@ flutter:
   #
   # For details regarding fonts from package dependencies,
   # see https://flutter.dev/to/font-from-package
+
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: "assets/icon/app_icon.png"
+  
